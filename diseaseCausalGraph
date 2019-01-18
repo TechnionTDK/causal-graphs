@@ -1,0 +1,172 @@
+# -*- coding: utf-8 -*-
+"""
+
+"""
+
+import graph_tool
+import numpy as np
+import graph_tool.topology
+import graph_tool.spectral
+import graph_tool.draw
+
+def edgeInclusionCriteriaM1(lenst,lents,lenbi):
+    return np.max([lenst , lents]) > 0
+def edgeInclusionCriteriaM2(lenst,lents,lenbi):
+    return np.max([lenst,lents])>1
+def edgeInclusionCriteriaM3(lenst,lents,lenbi):
+    return (lenbi + 0.0) / np.max([lenst , lents]) < 10
+def edgeInclusionCriteriaM4(lenst,lents,lenbi):
+    return (lenbi + 0.0) / (lenst + lents) < 2
+def edgeInclusionCriteriaM5(lenst,lents,lenbi):
+    return np.max([lenst,lents,lenbi])>6
+
+'''
+Load predicate tuples. Filter only causal predicates
+'''
+pn.read_csv('SemMedDBPredicate.csv')
+predicates = pn.read_csv('SemMedDBPredicate.csv') #read csv file containing the predicate table from SemMEDDB
+causePredicates = ['CAUSES','PREVENTS','DISRUPTS','INHIBITS',
+                    'PREDISPOSES','PRODUCES']
+twoDirectionalPredicates =['COEXISTS_WITH','ASSOCIATED_WITH']
+
+predCauses = predicates[predicates['PREDICATE'].isin(causePredicates)]
+preTwoDirectional = predicates[predicates['PREDICATE'].isin(twoDirectionalPredicates)]
+
+
+'''
+Build text-based graph.
+Limit the graph only to diseases, specifically diseases that are close to our target disease according to word2vec
+'''
+closestNodes = pn.read_csv('myDiseaseClosesNodes.csv')
+nodes = closestNodes['icd9'].unique()
+
+causalGraph = graph_tool.Graph()
+text_property = causalGraph.new_vertex_property("string")
+causalGraph.vertex_properties['text']= text_property
+
+nodeDict = {}
+for n in nodes:
+   newNode = causalGraph.add_vertex()
+   text_property[newNode] = n
+   nodeDict[n] = int(newNode)
+
+stedges=[]
+tsedges=[]
+bdedges=[]
+
+directedEdges =[]
+nonDirectedEdges=[]
+# for each pair of nodes. decide which edge to add
+nsindex = 0
+while nsindex<(len(nodes)-1):
+    print(nsindex)
+    ns = nodes[nsindex]
+    nsNames = closestNodes[closestNodes['icd9']==ns]['Name'].unique()
+    ntindex = nsindex+1
+    while ntindex<len(nodes):
+        print(ntindex)
+        nt = nodes[ntindex]
+        ntNames = closestNodes[closestNodes['icd9']==nt]['Name'].unique()
+        if ns==nt:
+            continue
+        sourceToTarget = predCauses[(predCauses['SUBJECT_NAME'].isin(nsNames))&(predCauses['OBJECT_NAME'].isin(ntNames))]
+        targetToSource = predCauses[(predCauses['SUBJECT_NAME'].isin(ntNames)) & (predCauses['OBJECT_NAME'].isin(nsNames))]
+        biderctional = preTwoDirectional[
+            ((preTwoDirectional['OBJECT_NAME'].isin(ntNames)) & (preTwoDirectional['SUBJECT_NAME'].isin(nsNames)))|
+            ((preTwoDirectional['OBJECT_NAME'].isin(nsNames)) & (preTwoDirectional['SUBJECT_NAME'].isin(ntNames)))
+        ]
+        stedges.append(len(sourceToTarget))
+        tsedges.append(len(targetToSource))
+        bdedges.append(len(biderctional))
+
+        if np.max([len(sourceToTarget),len(targetToSource)])==0:
+            ntindex += 1
+            continue
+        if edgeInclusionCriteriaM1(len(sourceToTarget),len(targetToSource),len(biderctional)):
+
+            maxVotes = np.argmax([len(sourceToTarget), len(targetToSource)])
+            if maxVotes == 0:
+                # add edge from source to target
+                directedEdges.append((nodeDict[ns], nodeDict[nt]))
+
+            if maxVotes == 1:
+                # add edge from target to source
+                directedEdges.append((nodeDict[nt], nodeDict[ns]))
+        else:
+            nonDirectedEdges.append((nodeDict[nt], nodeDict[ns]))
+
+
+        ntindex+=1
+    nsindex+=1
+
+causalGraph.add_edge_list(directedEdges)
+
+edgenumdf = pn.DataFrame()
+edgenumdf['st'] = stedges
+edgenumdf['ts'] = tsedges
+edgenumdf['bi'] = bdedges
+edgenumdf['ind'] = np.arange(0,len(stedges))
+
+
+'''
+Filter nodes by node2vec
+(node2vecRelevantCandudates.csv is created by running node2vec on the graph) - we use an extrnal code implemenation for this due to preformance 
+'''
+node2vecCandidates= pn.read_csv("node2vecRelevantCandudates.csv")
+node2vecCandidatesList = node2vecCandidates['nodeId'].unique()
+
+filter_property = causalGraph.new_vertex_property('bool')
+causalGraph.vertex_property['filt'] = filter_property
+
+for v in causalGraph.vertices():
+    if nodeDict[v] in node2vecCandidatesList:
+        filter_property[v]=True
+    else:
+        filter_property[v] = False
+
+causalGraphView = graph_tool.GraphView(causalGraph,filter_property)
+
+'''
+Build EMR graph. This graph is based on correlations found in the EMR repository.
+'''
+emrDF = pn.read_csv("EMRGraph.csv")
+
+EMRNodes = list(set(emrDF['s'].unique()).union(set(emrDF['t'].unique())))
+
+EMRCausalGraph = graph_tool.Graph()
+EMRCausalGraph.set_directed(False)
+emr_text_property = EMRCausalGraph.new_vertex_property("string")
+EMRCausalGraph.vertex_properties['text']= emr_text_property
+
+EMRnodeDict = {}
+for n in EMRNodes:
+   newNode = EMRCausalGraph.add_vertex()
+   emr_text_property[newNode] = n
+   EMRnodeDict[n] = int(newNode)
+
+edges=[]
+emrDF = emrDF[['s','t']]
+emrDF = emrDF.drop_duplicates()
+i=0
+while i<len(emrDF):
+    if (EMRnodeDict[emrDF.iloc[i]['t']],EMRnodeDict[emrDF.iloc[i]['s']]) in edges:
+        i+=1
+        continue
+    edges.append((EMRnodeDict[emrDF.iloc[i]['s']],EMRnodeDict[emrDF.iloc[i]['t']]))
+    i+=1
+EMRCausalGraph.add_edge_list(edges)
+
+'''
+Merged graphs 
+'''
+
+merge_property = causalGraphView.new_vertex_property("bool")
+causalGraphView.vertext_properties['merge'] = merge_property
+
+for v in causalGraphView.vertices():
+    if nodeDict[v] in EMRnodeDict.values():
+        merge_property[v]=True
+    else:
+        merge_property[v] = False
+
+causalGraphMerged = graph_tool.GraphView(causalGraphView,merge_property)
